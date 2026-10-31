@@ -114,11 +114,15 @@ src/
 └── playlist.rs   # Playlist management
 ```
 
-## Licensing
+## License
 
-This repository does not bundle VLC.
+RetroWave Player is licensed under the
+GNU General Public License v3.0 or later (GPL-3.0-or-later).
 
-Before distributing RetroWave Player together with VLC libraries or plugins, review the applicable VideoLAN licensing and redistribution requirements. Codec availability and patent obligations may vary depending on the runtime build and jurisdiction.
+You may use, modify, and redistribute this software
+under the terms of the license.
+
+See the LICENSE file for the full license text.
 
 ---
 
