@@ -33,6 +33,12 @@ pub fn configure_vlc_plugin_path() {
     }
 }
 
+fn is_no_audio_output_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("no active audio output")
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PlaybackState {
     #[default]
@@ -304,6 +310,7 @@ struct VlcEngine {
     volume: u8,
     muted: bool,
     rate: f32,
+    volume_pending: bool,
     state: PlaybackState,
     current_path: Option<PathBuf>,
     equalizer_settings: (bool, f32, [f32; 10]),
@@ -348,6 +355,7 @@ impl VlcEngine {
             volume: 70,
             muted: false,
             rate: 1.0,
+            volume_pending: false,
             state: PlaybackState::Stopped,
             current_path: None,
             equalizer_settings: (false, 0.0, [0.0; 10]),
@@ -448,12 +456,16 @@ impl VlcEngine {
     fn set_volume(&mut self, volume: u8) -> Result<(), String> {
         let result = unsafe { (self.api.audio_set_volume)(self.player, i32::from(volume)) };
         if result != 0 {
-            return Err(format!(
-                "libVLC could not set volume: {}",
-                self.last_error()
-            ));
+            let error = self.last_error();
+            if is_no_audio_output_error(&error) {
+                self.volume = volume;
+                self.volume_pending = true;
+                return Ok(());
+            }
+            return Err(format!("libVLC could not set volume: {error}"));
         }
         self.volume = volume;
+        self.volume_pending = false;
         Ok(())
     }
 
@@ -643,6 +655,11 @@ impl VlcEngine {
                 update_snapshot(snapshot, |snapshot| snapshot.error = Some(error));
             }
             _ => {}
+        }
+        if self.state == PlaybackState::Playing && self.volume_pending {
+            if let Err(error) = self.set_volume(self.volume) {
+                update_snapshot(snapshot, |snapshot| snapshot.error = Some(error));
+            }
         }
         let state = self.state;
         update_snapshot(snapshot, |snapshot| {
@@ -1008,10 +1025,24 @@ impl VlcApi {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    use super::is_no_audio_output_error;
+
+    #[test]
+    fn recognizes_only_the_temporary_missing_audio_output_error() {
+        assert!(is_no_audio_output_error(
+            "Audio output error: No active audio output"
+        ));
+        assert!(!is_no_audio_output_error(
+            "Could not set volume: invalid value"
+        ));
+    }
+
+    #[cfg(windows)]
     use super::load_library;
 
+    #[cfg(windows)]
     #[test]
     fn windows_load_failure_reports_the_original_error_code() {
         let missing = std::env::temp_dir().join("retrowave-missing-libvlc-test.dll");

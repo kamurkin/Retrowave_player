@@ -2,7 +2,10 @@ use crate::media::{MediaType, Track, format_time};
 use crate::playback::{Playback, PlaybackSnapshot, PlaybackState, TrackMetadata};
 use crate::playlist::Playlist;
 use crate::skin;
-use eframe::egui::{self, Color32, RichText, Stroke, Vec2, ViewportBuilder, ViewportId};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Frame, Margin, RichText, Stroke, ViewportBuilder, ViewportId,
+    pos2, vec2,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -99,6 +102,19 @@ impl RetroWaveApp {
         };
         let path = track.path.clone();
         let is_video = track.media_type == MediaType::Video;
+        if self.snapshot.path.as_ref() == Some(&path) {
+            match self.snapshot.state {
+                PlaybackState::Paused => {
+                    self.playlist.current = Some(index);
+                    self.playlist.selected = Some(index);
+                    self.notice = None;
+                    self.playback.pause();
+                    return;
+                }
+                PlaybackState::Playing | PlaybackState::Loading => return,
+                PlaybackState::Stopped => {}
+            }
+        }
         self.playlist.current = Some(index);
         self.playlist.selected = Some(index);
         self.notice = None;
@@ -153,123 +169,214 @@ impl RetroWaveApp {
     }
 
     fn show_player(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("RETROWAVE").color(skin::GOLD).strong());
-            ui.label(RichText::new("PLAYER").color(skin::TEXT));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("X").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.small_button("_").clicked() {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                }
-            });
-        });
-        ui.add_space(3.0);
+        ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
+        let title = skin::title_bar(
+            ui,
+            "RETROWAVE PLAYER",
+            &[
+                ("PL", self.playlist_open),
+                ("EQ", self.equalizer_open),
+                ("_", false),
+                ("X", false),
+            ],
+        );
+        if title.drag_started {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        match title.clicked {
+            Some(0) => self.playlist_open = !self.playlist_open,
+            Some(1) => self.equalizer_open = !self.equalizer_open,
+            Some(2) => ui
+                .ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            Some(3) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
 
-        egui::Frame::new()
-            .fill(skin::PANEL)
-            .stroke(Stroke::new(1.0, skin::RAISED))
-            .inner_margin(egui::Margin::same(7))
+        Frame::new()
+            .fill(skin::PANEL_BG)
+            .inner_margin(Margin::same(5))
             .show(ui, |ui| {
-                let current = self
-                    .playlist
-                    .current
-                    .and_then(|index| self.playlist.tracks.get(index));
-                let title = current.map_or("NO TRACK LOADED", |track| track.title.as_str());
-                let artist = current
-                    .and_then(|track| track.artist.as_deref())
-                    .unwrap_or("RETROWAVE PLAYER");
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(title).color(skin::LCD).strong().size(15.0));
-                        ui.label(RichText::new(artist).color(skin::LCD).size(11.0));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} / {}",
-                                format_time(self.snapshot.position),
-                                format_time(self.snapshot.duration)
-                            ))
-                            .color(skin::LCD)
-                            .monospace()
-                            .size(15.0),
-                        );
-                    });
-                });
-                ui.add_space(5.0);
-                ui.label(
-                    RichText::new(self.visualizer_status())
-                        .color(skin::MUTED)
-                        .small(),
-                );
+                self.show_lcd(ui);
+                ui.add_space(2.0);
+                self.show_seek(ui);
+                ui.add_space(2.0);
+                self.show_transport(ui);
+                self.show_playback_options(ui);
+                if let Some(error) = &self.snapshot.error {
+                    ui.label(RichText::new(error).color(skin::LCD_RED).size(8.0));
+                } else if let Some(notice) = &self.notice {
+                    ui.label(RichText::new(notice).color(skin::LCD_YELLOW).size(8.0));
+                } else if !self.snapshot.ready {
+                    ui.label(
+                        RichText::new("INITIALIZING LIBVLC")
+                            .color(skin::LCD_DIM)
+                            .size(7.0),
+                    );
+                }
             });
+    }
 
+    fn show_lcd(&self, ui: &mut egui::Ui) {
+        let rect = skin::lcd_panel(ui, vec2(ui.available_width(), 46.0));
+        let painter = ui.painter().with_clip_rect(rect.shrink(4.0));
+        let current = self
+            .playlist
+            .current
+            .and_then(|index| self.playlist.tracks.get(index));
+        let title = current.map_or("NO TRACK LOADED", |track| track.title.as_str());
+        let artist = current
+            .and_then(|track| track.artist.as_deref())
+            .or_else(|| current.and_then(|track| track.album.as_deref()))
+            .unwrap_or("RETROWAVE PLAYER");
+        painter.text(
+            pos2(rect.left() + 6.0, rect.top() + 15.0),
+            Align2::LEFT_CENTER,
+            format_time(self.snapshot.position),
+            FontId::monospace(20.0),
+            skin::LCD_GREEN,
+        );
+        painter.text(
+            pos2(rect.left() + 7.0, rect.bottom() - 7.0),
+            Align2::LEFT_CENTER,
+            self.playback_status(),
+            FontId::monospace(7.0),
+            skin::LCD_DIM,
+        );
+        painter.text(
+            pos2(rect.left() + 92.0, rect.top() + 13.0),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::monospace(9.0),
+            skin::LCD_GREEN,
+        );
+        painter.text(
+            pos2(rect.left() + 92.0, rect.top() + 27.0),
+            Align2::LEFT_CENTER,
+            artist,
+            FontId::monospace(7.5),
+            skin::LCD_DIM,
+        );
+        painter.text(
+            pos2(rect.right() - 6.0, rect.bottom() - 7.0),
+            Align2::RIGHT_CENTER,
+            "SPECTRUM // N/A",
+            FontId::monospace(6.5),
+            skin::LCD_DIM,
+        );
+    }
+
+    fn playback_status(&self) -> &'static str {
+        match self.snapshot.state {
+            PlaybackState::Stopped => "STOPPED",
+            PlaybackState::Loading => "OPENING",
+            PlaybackState::Playing => "PLAYING",
+            PlaybackState::Paused => "PAUSED",
+        }
+    }
+
+    fn show_seek(&mut self, ui: &mut egui::Ui) {
         let max_seek = self
             .snapshot
             .duration
-            .map(|duration| duration.as_secs_f64())
+            .map(|duration| duration.as_secs_f32())
             .unwrap_or(1.0)
             .max(1.0);
         if self.snapshot.position.is_some() {
             self.seek_value = self.snapshot.position.unwrap().as_secs_f64();
         }
-        let seek_response = ui.add_enabled(
-            self.snapshot.duration.is_some() && self.snapshot.path.is_some(),
-            egui::Slider::new(&mut self.seek_value, 0.0..=max_seek)
-                .show_value(false)
-                .text(""),
-        );
-        if seek_response.drag_stopped() || seek_response.clicked() {
-            self.playback.seek(Duration::from_secs_f64(
-                self.seek_value.clamp(0.0, max_seek),
-            ));
-        }
-
         ui.horizontal(|ui| {
-            if ui.button("|<").on_hover_text("Previous").clicked() {
+            ui.label(
+                RichText::new(format_time(self.snapshot.position))
+                    .monospace()
+                    .size(8.0)
+                    .color(skin::LCD_DIM),
+            );
+            let slider_width = (ui.available_width() - 38.0).max(72.0);
+            let mut position = self.seek_value as f32;
+            let response = skin::h_slider(ui, &mut position, 0.0..=max_seek, slider_width);
+            self.seek_value = f64::from(position);
+            if (response.drag_stopped() || response.clicked()) && self.snapshot.duration.is_some() {
+                self.playback
+                    .seek(Duration::from_secs_f32(position.clamp(0.0, max_seek)));
+            }
+            ui.label(
+                RichText::new(format_time(self.snapshot.duration))
+                    .monospace()
+                    .size(8.0)
+                    .color(skin::LCD_DIM),
+            );
+        });
+    }
+
+    fn show_transport(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if skin::transport_button(ui, skin::TransportIcon::Previous, false).clicked() {
                 self.play_next(-1);
             }
-            if ui.button("▶").on_hover_text("Play").clicked() {
+            if skin::transport_button(
+                ui,
+                skin::TransportIcon::Play,
+                self.snapshot.state == PlaybackState::Playing,
+            )
+            .clicked()
+            {
                 self.play_selected();
             }
-            if ui.button("||").on_hover_text("Pause / resume").clicked() {
+            if skin::transport_button(
+                ui,
+                skin::TransportIcon::Pause,
+                self.snapshot.state == PlaybackState::Paused,
+            )
+            .clicked()
+            {
                 if self.snapshot.path.is_none() || self.snapshot.state == PlaybackState::Stopped {
                     self.play_selected();
                 } else {
                     self.playback.pause();
                 }
             }
-            if ui.button("[]").on_hover_text("Stop").clicked() {
+            if skin::transport_button(ui, skin::TransportIcon::Stop, false).clicked() {
                 self.playback.stop();
             }
-            if ui.button(">|").on_hover_text("Next").clicked() {
+            if skin::transport_button(ui, skin::TransportIcon::Next, false).clicked() {
                 self.play_next(1);
             }
-            ui.separator();
-            if ui
-                .add(egui::Slider::new(&mut self.volume, 0..=100).show_value(false))
-                .changed()
-            {
-                self.playback.set_volume(self.volume);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("VOL")
+                    .monospace()
+                    .size(7.0)
+                    .color(skin::TEXT_DIM),
+            );
+            let slider_width = (ui.available_width() - 48.0).max(48.0);
+            let mut volume = f32::from(self.volume);
+            let response = skin::h_slider(ui, &mut volume, 0.0..=100.0, slider_width);
+            if response.dragged() || response.drag_stopped() || response.clicked() {
+                let new_volume = volume.round() as u8;
+                if new_volume != self.volume {
+                    self.volume = new_volume;
+                    self.playback.set_volume(new_volume);
+                }
             }
-            if ui
-                .selectable_label(self.muted, "MUTE")
-                .on_hover_text("Mute")
-                .clicked()
-            {
+            if skin::text_button(ui, "M", vec2(20.0, 18.0), self.muted, true).clicked() {
                 self.muted = !self.muted;
                 self.playback.set_muted(self.muted);
             }
         });
+    }
+
+    fn show_playback_options(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("SPEED").color(skin::MUTED));
+            ui.label(
+                RichText::new("SPD")
+                    .monospace()
+                    .size(7.0)
+                    .color(skin::TEXT_DIM),
+            );
             egui::ComboBox::from_id_salt("playback-speed")
                 .selected_text(format!("{:.2}x", self.rate))
-                .width(70.0)
+                .width(55.0)
                 .show_ui(ui, |ui| {
                     for rate in [0.5_f32, 0.75, 1.0, 1.25, 1.5, 2.0] {
                         if ui
@@ -280,115 +387,81 @@ impl RetroWaveApp {
                         }
                     }
                 });
-            if ui
-                .selectable_label(self.playlist_open, "PL")
-                .on_hover_text("Playlist editor")
-                .clicked()
-            {
-                self.playlist_open = !self.playlist_open;
-            }
-            if ui
-                .selectable_label(self.equalizer_open, "EQ")
-                .on_hover_text("Equalizer")
-                .clicked()
-            {
-                self.equalizer_open = !self.equalizer_open;
-            }
-            let video_loaded = self
+            self.show_track_menus(ui);
+            if self
                 .playlist
                 .current
                 .and_then(|index| self.playlist.tracks.get(index))
-                .is_some_and(|track| track.media_type == MediaType::Video);
-            if ui
-                .add_enabled(video_loaded || self.video_open, egui::Button::new("VIDEO"))
-                .clicked()
+                .is_some_and(|track| track.media_type == MediaType::Video)
+                && skin::text_button(ui, "VID", vec2(28.0, 18.0), self.video_open, true).clicked()
             {
-                self.video_open = !self.video_open;
-                if !self.video_open {
-                    self.video_target = 0;
-                    self.playback.set_video_target(0);
-                }
-            }
-            ui.label(RichText::new(self.playlist.summary()).color(skin::MUTED));
-        });
-
-        ui.horizontal(|ui| {
-            if !self.snapshot.audio_tracks.is_empty() {
-                egui::ComboBox::from_id_salt("audio-track")
-                    .selected_text("AUDIO")
-                    .show_ui(ui, |ui| {
-                        let tracks = self.snapshot.audio_tracks.clone();
-                        for track in tracks {
-                            if ui.button(&track.label).clicked() {
-                                self.playback.set_audio_track(track.id);
-                            }
-                        }
-                    });
-            }
-            if !self.snapshot.subtitles.is_empty() {
-                egui::ComboBox::from_id_salt("subtitle-track")
-                    .selected_text("SUBTITLE")
-                    .show_ui(ui, |ui| {
-                        let tracks = self.snapshot.subtitles.clone();
-                        for track in tracks {
-                            if ui.button(&track.label).clicked() {
-                                self.playback.set_subtitle(track.id);
-                            }
-                        }
-                        if ui.button("Off").clicked() {
-                            self.playback.set_subtitle(-1);
-                        }
-                    });
-            }
-            if ui.button("ADD SRT/ASS").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Subtitles", &["srt", "ass"])
-                    .pick_file()
-                {
-                    self.playback.add_subtitle(path);
-                }
+                self.toggle_video();
             }
         });
+    }
 
-        if let Some(error) = &self.snapshot.error {
-            ui.label(RichText::new(error).color(Color32::from_rgb(255, 104, 85)));
-        } else if let Some(notice) = &self.notice {
-            ui.label(RichText::new(notice).color(Color32::from_rgb(255, 190, 90)));
-        } else if !self.snapshot.ready {
-            ui.label(
-                RichText::new("INITIALIZING LIBVLC…")
-                    .color(skin::GOLD)
-                    .small(),
-            );
+    fn show_track_menus(&mut self, ui: &mut egui::Ui) {
+        if !self.snapshot.audio_tracks.is_empty() {
+            egui::ComboBox::from_id_salt("audio-track")
+                .selected_text("AUD")
+                .width(42.0)
+                .show_ui(ui, |ui| {
+                    let tracks = self.snapshot.audio_tracks.clone();
+                    for track in tracks {
+                        if ui.selectable_label(false, &track.label).clicked() {
+                            self.playback.set_audio_track(track.id);
+                        }
+                    }
+                });
+        }
+        if !self.snapshot.subtitles.is_empty() {
+            egui::ComboBox::from_id_salt("subtitle-track")
+                .selected_text("SUB")
+                .width(42.0)
+                .show_ui(ui, |ui| {
+                    let tracks = self.snapshot.subtitles.clone();
+                    for track in tracks {
+                        if ui.selectable_label(false, &track.label).clicked() {
+                            self.playback.set_subtitle(track.id);
+                        }
+                    }
+                    if ui.selectable_label(false, "Off").clicked() {
+                        self.playback.set_subtitle(-1);
+                    }
+                });
+        }
+        if skin::text_button(ui, "SRT+", vec2(30.0, 18.0), false, true).clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Subtitles", &["srt", "ass"])
+                .pick_file()
+            {
+                self.playback.add_subtitle(path);
+            }
         }
     }
 
-    fn visualizer_status(&self) -> &'static str {
-        match (self.snapshot.state, self.snapshot.path.is_some()) {
-            (PlaybackState::Playing, true) => "AUDIO VISUALIZER  •  PCM TAP UNAVAILABLE",
-            (PlaybackState::Loading, true) => "OPENING MEDIA",
-            (PlaybackState::Paused, true) => "PLAYBACK PAUSED",
-            (_, false) => "NO AUDIO SIGNAL",
-            _ => "READY",
+    fn toggle_video(&mut self) {
+        self.video_open = !self.video_open;
+        if !self.video_open {
+            self.video_target = 0;
+            self.playback.set_video_target(0);
         }
     }
 
     fn show_playlist(&mut self, ui: &mut egui::Ui) {
+        let title = skin::title_bar(ui, "PLAYLIST EDITOR", &[("X", false)]);
+        if title.drag_started {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if title.clicked == Some(0) {
+            self.playlist_open = false;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PLAYLIST EDITOR").color(skin::GOLD).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("X").clicked() {
-                    self.playlist_open = false;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("ADD FILES").clicked() {
+            if skin::text_button(ui, "ADD FILES", vec2(56.0, 18.0), false, true).clicked() {
                 self.choose_files();
             }
-            if ui.button("REMOVE").clicked() {
+            if skin::text_button(ui, "REMOVE", vec2(48.0, 18.0), false, true).clicked() {
                 let removed = self.playlist.remove_selected();
                 if removed
                     .as_ref()
@@ -401,7 +474,7 @@ impl RetroWaveApp {
                     self.pending_video = None;
                 }
             }
-            if ui.button("CLEAR").clicked() {
+            if skin::text_button(ui, "CLEAR", vec2(42.0, 18.0), false, true).clicked() {
                 self.playlist.clear();
                 self.playback.stop();
                 self.playback.set_video_target(0);
@@ -411,18 +484,18 @@ impl RetroWaveApp {
             }
         });
         ui.add_space(4.0);
-        egui::Frame::new()
-            .fill(skin::PANEL)
-            .stroke(Stroke::new(1.0, skin::RAISED))
-            .inner_margin(egui::Margin::same(4))
+        Frame::new()
+            .fill(skin::PANEL_DARK)
+            .stroke(Stroke::new(1.0, skin::BEVEL_LIGHT))
+            .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 egui::Grid::new("playlist-header")
                     .num_columns(3)
                     .striped(false)
                     .show(ui, |ui| {
-                        ui.label(RichText::new("TITLE").color(skin::GOLD));
-                        ui.label(RichText::new("TYPE").color(skin::GOLD));
-                        ui.label(RichText::new("LENGTH").color(skin::GOLD));
+                        ui.label(RichText::new("TITLE").color(skin::ACCENT));
+                        ui.label(RichText::new("TYPE").color(skin::ACCENT));
+                        ui.label(RichText::new("LENGTH").color(skin::ACCENT));
                         ui.end_row();
                     });
                 egui::ScrollArea::vertical()
@@ -444,9 +517,9 @@ impl RetroWaveApp {
                             let response = ui.selectable_label(
                                 selected,
                                 RichText::new(text).color(if is_current {
-                                    skin::LCD
+                                    skin::LCD_GREEN
                                 } else {
-                                    skin::TEXT
+                                    skin::TITLE_TEXT
                                 }),
                             );
                             if response.clicked() {
@@ -465,10 +538,10 @@ impl RetroWaveApp {
                     });
             });
         ui.add_space(5.0);
-        ui.label(RichText::new(self.playlist.summary()).color(skin::LCD));
+        ui.label(RichText::new(self.playlist.summary()).color(skin::LCD_GREEN));
         ui.label(
             RichText::new("Drop MP3 / FLAC / WAV / MP4 / MKV / AVI files here.")
-                .color(skin::MUTED)
+                .color(skin::TEXT_DIM)
                 .small(),
         );
         let dropped = ui.ctx().input(|input| {
@@ -485,18 +558,16 @@ impl RetroWaveApp {
     }
 
     fn show_equalizer(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("EQUALIZER").color(skin::GOLD).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("X").clicked() {
-                    self.equalizer_open = false;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
-        ui.separator();
+        let title = skin::title_bar(ui, "EQUALIZER", &[("X", false)]);
+        if title.drag_started {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if title.clicked == Some(0) {
+            self.equalizer_open = false;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.snapshot.equalizer_supported {
-            ui.label(RichText::new("DSP: LIBVLC EQUALIZER").color(skin::LCD));
+            ui.label(RichText::new("DSP: LIBVLC EQUALIZER").color(skin::LCD_GREEN));
         } else {
             ui.label(
                 RichText::new("DSP NOT AVAILABLE IN THE LOADED VLC RUNTIME")
@@ -506,41 +577,56 @@ impl RetroWaveApp {
         let mut changed = false;
         ui.add_enabled_ui(self.snapshot.equalizer_supported, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.equalizer_enabled, "EQ ON")
-                    .clicked()
+                if skin::text_button(
+                    ui,
+                    "EQ ON",
+                    vec2(40.0, 18.0),
+                    self.equalizer_enabled,
+                    self.snapshot.equalizer_supported,
+                )
+                .clicked()
                 {
                     self.equalizer_enabled = !self.equalizer_enabled;
                     changed = true;
                 }
                 ui.label("PREAMP");
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.preamp, -20.0..=20.0).show_value(true))
-                    .changed();
+                let slider_width = (ui.available_width() - 70.0).max(80.0);
+                let previous_preamp = self.preamp;
+                skin::h_slider(ui, &mut self.preamp, -20.0..=20.0, slider_width);
+                changed |= self.preamp != previous_preamp;
+                ui.label(
+                    RichText::new(format!("{:.1}", self.preamp))
+                        .monospace()
+                        .size(8.0),
+                );
             });
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 for (index, band) in self.bands.iter_mut().enumerate() {
                     ui.vertical(|ui| {
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(band, -20.0..=20.0)
-                                    .vertical()
-                                    .show_value(false),
-                            )
-                            .changed();
-                        ui.label(RichText::new(BANDS[index]).color(skin::MUTED).small());
+                        let previous_band = *band;
+                        skin::v_slider(
+                            ui,
+                            band,
+                            -20.0..=20.0,
+                            vec2(20.0, 88.0),
+                            self.snapshot.equalizer_supported,
+                        );
+                        changed |= *band != previous_band;
+                        ui.label(RichText::new(BANDS[index]).color(skin::TEXT_DIM).size(7.0));
                     });
                 }
             });
         });
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.snapshot.equalizer_supported,
-                    egui::Button::new("FLAT / RESET"),
-                )
-                .clicked()
+            if skin::text_button(
+                ui,
+                "FLAT / RESET",
+                vec2(68.0, 18.0),
+                false,
+                self.snapshot.equalizer_supported,
+            )
+            .clicked()
             {
                 self.preamp = 0.0;
                 self.bands = [0.0; 10];
@@ -573,20 +659,24 @@ impl RetroWaveApp {
         ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::BLACK);
         let mut close_video = false;
         if !self.video_fullscreen {
+            let title = skin::title_bar(ui, "RETROWAVE VIDEO", &[("X", false)]);
+            if title.drag_started {
+                context.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            close_video = title.clicked == Some(0);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("FULLSCREEN").clicked() {
+                    if skin::text_button(ui, "FULLSCREEN", vec2(64.0, 18.0), false, true).clicked()
+                    {
                         self.video_fullscreen = true;
                         ui.ctx()
                             .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                     }
-                    if ui.button("CLOSE VIDEO").clicked() {
-                        close_video = true;
-                    }
                     ui.label(
-                        RichText::new("ESC exits fullscreen")
-                            .color(skin::TEXT)
-                            .small(),
+                        RichText::new("VIDEO // ESC EXITS FULLSCREEN")
+                            .color(skin::TEXT_DIM)
+                            .monospace()
+                            .size(8.0),
                     );
                 });
             });
@@ -623,8 +713,9 @@ impl RetroWaveApp {
                 playlist_viewport(),
                 ViewportBuilder::default()
                     .with_title("RetroWave Playlist")
-                    .with_inner_size([500.0, 340.0])
-                    .with_min_inner_size([380.0, 220.0]),
+                    .with_inner_size([500.0, 330.0])
+                    .with_min_inner_size([380.0, 220.0])
+                    .with_decorations(false),
                 |ui, _| {
                     skin::apply(ui.ctx());
                     close_requested.set(ui.ctx().input(|input| input.viewport().close_requested()));
@@ -641,8 +732,11 @@ impl RetroWaveApp {
                 equalizer_viewport(),
                 ViewportBuilder::default()
                     .with_title("RetroWave Equalizer")
-                    .with_inner_size([400.0, 250.0])
-                    .with_min_inner_size([350.0, 220.0]),
+                    .with_inner_size([300.0, 195.0])
+                    .with_min_inner_size([300.0, 195.0])
+                    .with_max_inner_size([300.0, 195.0])
+                    .with_resizable(false)
+                    .with_decorations(false),
                 |ui, _| {
                     skin::apply(ui.ctx());
                     close_requested.set(ui.ctx().input(|input| input.viewport().close_requested()));
@@ -661,6 +755,7 @@ impl RetroWaveApp {
                     .with_title(VIDEO_TITLE)
                     .with_inner_size([720.0, 405.0])
                     .with_min_inner_size([320.0, 180.0])
+                    .with_decorations(false)
                     .with_fullscreen(self.video_fullscreen),
                 |ui, _| {
                     close_requested.set(ui.ctx().input(|input| input.viewport().close_requested()));
@@ -695,9 +790,9 @@ impl eframe::App for RetroWaveApp {
             self.add_paths(dropped);
         }
 
-        egui::Frame::new()
-            .fill(skin::FRAME)
-            .inner_margin(egui::Margin::same(8))
+        Frame::new()
+            .fill(skin::PANEL_DARK)
+            .inner_margin(Margin::same(3))
             .show(root_ui, |ui| self.show_player(ui));
         self.render_child_windows(&context);
         context.request_repaint_after(Duration::from_millis(100));
