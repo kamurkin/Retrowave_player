@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_float, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -40,6 +41,152 @@ fn is_no_audio_output_error(error: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DeferredPauseState {
+    #[default]
+    None,
+    Requested,
+    PauseSent,
+    ResumeSent,
+}
+
+fn toggle_loading_pause_request(state: DeferredPauseState) -> DeferredPauseState {
+    match state {
+        DeferredPauseState::None => DeferredPauseState::Requested,
+        DeferredPauseState::Requested => DeferredPauseState::None,
+        DeferredPauseState::PauseSent => DeferredPauseState::ResumeSent,
+        DeferredPauseState::ResumeSent => DeferredPauseState::PauseSent,
+    }
+}
+
+fn apply_confirmed_vlc_state(
+    phase: PlayRequestPhase,
+    deferred: DeferredPauseState,
+    vlc_state: i32,
+) -> (PlayRequestPhase, DeferredPauseState, PlaybackState, bool) {
+    match vlc_state {
+        3 => match deferred {
+            DeferredPauseState::Requested => (
+                phase,
+                DeferredPauseState::PauseSent,
+                PlaybackState::Loading,
+                true,
+            ),
+            DeferredPauseState::PauseSent => (
+                phase,
+                DeferredPauseState::PauseSent,
+                PlaybackState::Loading,
+                false,
+            ),
+            DeferredPauseState::ResumeSent => {
+                let phase = match phase {
+                    PlayRequestPhase::Loading(id) | PlayRequestPhase::PendingDelay(id) => {
+                        PlayRequestPhase::Active(id)
+                    }
+                    other => other,
+                };
+                (
+                    phase,
+                    DeferredPauseState::None,
+                    PlaybackState::Playing,
+                    false,
+                )
+            }
+            DeferredPauseState::None => {
+                let phase = match phase {
+                    PlayRequestPhase::Loading(id) | PlayRequestPhase::PendingDelay(id) => {
+                        PlayRequestPhase::Active(id)
+                    }
+                    other => other,
+                };
+                (
+                    phase,
+                    DeferredPauseState::None,
+                    PlaybackState::Playing,
+                    false,
+                )
+            }
+        },
+        4 => {
+            let phase = match phase {
+                PlayRequestPhase::Loading(id) | PlayRequestPhase::PendingDelay(id) => {
+                    PlayRequestPhase::Active(id)
+                }
+                other => other,
+            };
+            (
+                phase,
+                DeferredPauseState::None,
+                PlaybackState::Paused,
+                false,
+            )
+        }
+        1 | 2 => (phase, deferred, PlaybackState::Loading, false),
+        5 | 6 | 7 => (
+            PlayRequestPhase::None,
+            DeferredPauseState::None,
+            PlaybackState::Stopped,
+            false,
+        ),
+        _ => (phase, deferred, PlaybackState::Loading, false),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlayRequestPhase {
+    #[default]
+    None,
+    PendingDelay(u64),
+    Loading(u64),
+    Active(u64),
+}
+
+#[cfg(debug_assertions)]
+const DEFAULT_DEBUG_LOADING_DELAY_MS: u64 = 3000;
+
+#[cfg(debug_assertions)]
+fn debug_loading_delay_ms() -> u64 {
+    std::env::var("RETROWAVE_DEBUG_LOADING_DELAY_MS")
+        .ok()
+        .as_deref()
+        .map(parse_debug_loading_delay_ms)
+        .unwrap_or(DEFAULT_DEBUG_LOADING_DELAY_MS)
+}
+
+#[cfg(debug_assertions)]
+fn parse_debug_loading_delay_ms(value: &str) -> u64 {
+    value
+        .parse::<u64>()
+        .ok()
+        .unwrap_or(DEFAULT_DEBUG_LOADING_DELAY_MS)
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+struct PendingPlay {
+    command: Command,
+    ready_at: Instant,
+}
+
+#[cfg(debug_assertions)]
+fn pending_play_is_ready(ready_at: Instant, now: Instant) -> bool {
+    now >= ready_at
+}
+
+#[cfg(debug_assertions)]
+impl PendingPlay {
+    fn new(command: Command, delay_ms: u64, now: Instant) -> Self {
+        Self {
+            command,
+            ready_at: now + Duration::from_millis(delay_ms),
+        }
+    }
+
+    fn is_ready(&self, now: Instant) -> bool {
+        pending_play_is_ready(self.ready_at, now)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PlaybackState {
     #[default]
     Stopped,
@@ -66,6 +213,8 @@ pub struct TrackOption {
 pub struct PlaybackSnapshot {
     pub ready: bool,
     pub state: PlaybackState,
+    pub play_request_phase: PlayRequestPhase,
+    pub natural_end_event: Option<NaturalEndEvent>,
     pub path: Option<PathBuf>,
     pub position: Option<Duration>,
     pub duration: Option<Duration>,
@@ -73,10 +222,25 @@ pub struct PlaybackSnapshot {
     pub muted: bool,
     pub rate: f32,
     pub error: Option<String>,
+    pub history_warning: Option<String>,
+    pub video_play_result: Option<VideoPlayResult>,
     pub metadata: HashMap<PathBuf, TrackMetadata>,
     pub audio_tracks: Vec<TrackOption>,
     pub subtitles: Vec<TrackOption>,
     pub equalizer_supported: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoPlayResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NaturalEndEvent {
+    pub event_id: u64,
+    pub generation: u64,
+    pub request_id: u64,
 }
 
 impl Default for PlaybackSnapshot {
@@ -84,6 +248,8 @@ impl Default for PlaybackSnapshot {
         Self {
             ready: false,
             state: PlaybackState::Stopped,
+            play_request_phase: PlayRequestPhase::None,
+            natural_end_event: None,
             path: None,
             position: None,
             duration: None,
@@ -91,6 +257,8 @@ impl Default for PlaybackSnapshot {
             muted: false,
             rate: 1.0,
             error: None,
+            history_warning: None,
+            video_play_result: None,
             metadata: HashMap::new(),
             audio_tracks: Vec::new(),
             subtitles: Vec::new(),
@@ -99,9 +267,17 @@ impl Default for PlaybackSnapshot {
     }
 }
 
+#[derive(Clone)]
 enum Command {
-    Play(PathBuf, usize),
-    Pause,
+    Play {
+        path: PathBuf,
+        target: usize,
+        request_id: u64,
+        is_video: bool,
+    },
+    Pause {
+        request_id: Option<u64>,
+    },
     Stop,
     Seek(Duration),
     Volume(u8),
@@ -113,6 +289,15 @@ enum Command {
     AudioTrack(i32),
     Subtitle(i32),
     Equalizer(bool, f32, [f32; 10]),
+    NaturalEndReached {
+        generation: u64,
+        request_id: u64,
+    },
+    AcknowledgeNaturalEnd {
+        event_id: u64,
+        generation: u64,
+        request_id: u64,
+    },
 }
 
 pub struct Playback {
@@ -125,9 +310,10 @@ impl Playback {
         let (sender, receiver) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
         let worker_snapshot = Arc::clone(&snapshot);
+        let callback_sender = sender.clone();
         if let Err(error) = thread::Builder::new()
             .name("retrowave-libvlc".to_owned())
-            .spawn(move || playback_worker(receiver, worker_snapshot))
+            .spawn(move || playback_worker(receiver, worker_snapshot, callback_sender))
         {
             update_snapshot(&snapshot, |state| {
                 state.error = Some(format!("Could not start playback worker: {error}"));
@@ -144,16 +330,35 @@ impl Playback {
             .clone()
     }
 
-    pub fn play(&self, path: PathBuf, video_target: usize) {
-        self.send(Command::Play(path, video_target));
+    pub fn play(&self, path: PathBuf, video_target: usize, request_id: u64, is_video: bool) {
+        self.send(Command::Play {
+            path,
+            target: video_target,
+            request_id,
+            is_video,
+        });
     }
 
     pub fn pause(&self) {
-        self.send(Command::Pause);
+        self.send(Command::Pause { request_id: None });
+    }
+
+    pub fn pause_for_request(&self, request_id: u64) {
+        self.send(Command::Pause {
+            request_id: Some(request_id),
+        });
     }
 
     pub fn stop(&self) {
         self.send(Command::Stop);
+    }
+
+    pub fn acknowledge_natural_end(&self, event: &NaturalEndEvent) {
+        self.send(Command::AcknowledgeNaturalEnd {
+            event_id: event.event_id,
+            generation: event.generation,
+            request_id: event.request_id,
+        });
     }
 
     pub fn seek(&self, time: Duration) {
@@ -211,8 +416,12 @@ impl Playback {
     }
 }
 
-fn playback_worker(receiver: Receiver<Command>, snapshot: Arc<Mutex<PlaybackSnapshot>>) {
-    let mut engine = match VlcEngine::new() {
+fn playback_worker(
+    receiver: Receiver<Command>,
+    snapshot: Arc<Mutex<PlaybackSnapshot>>,
+    callback_sender: Sender<Command>,
+) {
+    let mut engine = match VlcEngine::new(callback_sender) {
         Ok(engine) => engine,
         Err(error) => {
             update_snapshot(&snapshot, |state| state.error = Some(error));
@@ -229,16 +438,64 @@ fn playback_worker(receiver: Receiver<Command>, snapshot: Arc<Mutex<PlaybackSnap
     });
 
     let mut probes = Vec::<Probe>::new();
+    #[cfg(debug_assertions)]
+    let mut pending_play: Option<PendingPlay> = None;
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(command) => {
-                if process_command(command, &mut engine, &snapshot, &mut probes) {
-                    break;
+                #[cfg(debug_assertions)]
+                {
+                    let delayed_request_id = match &command {
+                        Command::Play { request_id, .. } => Some(*request_id),
+                        _ => None,
+                    };
+                    if let Some(request_id) = delayed_request_id {
+                        let delay_ms = debug_loading_delay_ms();
+                        if delay_ms > 0 {
+                            engine.state = PlaybackState::Loading;
+                            engine.play_request_phase = PlayRequestPhase::PendingDelay(request_id);
+                            engine.deferred_pause = DeferredPauseState::None;
+                            pending_play =
+                                Some(PendingPlay::new(command, delay_ms, Instant::now()));
+                            update_snapshot(&snapshot, |state| {
+                                state.state = PlaybackState::Loading;
+                                state.play_request_phase =
+                                    PlayRequestPhase::PendingDelay(request_id);
+                                state.error = None;
+                                state.video_play_result = None;
+                            });
+                            continue;
+                        }
+                        pending_play = None;
+                    }
+                    if matches!(command, Command::Stop) {
+                        pending_play = None;
+                    }
+                }
+                match process_command(command, &mut engine, &snapshot, &mut probes, false) {
+                    true => break,
+                    false => {}
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        #[cfg(debug_assertions)]
+        if pending_play
+            .as_ref()
+            .is_some_and(|pending| pending.is_ready(Instant::now()))
+        {
+            let command = pending_play
+                .take()
+                .expect("pending Play was checked")
+                .command;
+            let _ = process_command(command, &mut engine, &snapshot, &mut probes, true);
+        }
+        #[cfg(debug_assertions)]
+        if pending_play.is_none() {
+            engine.refresh(&snapshot);
+        }
+        #[cfg(not(debug_assertions))]
         engine.refresh(&snapshot);
         poll_probes(&mut engine, &snapshot, &mut probes);
     }
@@ -249,10 +506,30 @@ fn process_command(
     engine: &mut VlcEngine,
     snapshot: &Arc<Mutex<PlaybackSnapshot>>,
     probes: &mut Vec<Probe>,
+    preserve_pending_pause: bool,
 ) -> bool {
+    let play_result = match &command {
+        Command::Play {
+            request_id,
+            is_video,
+            ..
+        } => Some((*request_id, *is_video)),
+        _ => None,
+    };
+    let stop_result = matches!(&command, Command::Stop);
     let result = match command {
-        Command::Play(path, target) => engine.play(path, target),
-        Command::Pause => engine.pause(),
+        Command::Play {
+            path,
+            target,
+            request_id,
+            is_video: _,
+        } => {
+            if !preserve_pending_pause {
+                engine.deferred_pause = DeferredPauseState::None;
+            }
+            engine.play(path, target, request_id)
+        }
+        Command::Pause { request_id } => engine.pause(request_id),
         Command::Stop => engine.stop(),
         Command::Seek(time) => engine.seek(time),
         Command::Volume(volume) => engine.set_volume(volume),
@@ -270,6 +547,49 @@ fn process_command(
         Command::AudioTrack(id) => engine.set_audio_track(id),
         Command::Subtitle(id) => engine.set_subtitle(id),
         Command::Equalizer(enabled, preamp, bands) => engine.set_equalizer(enabled, preamp, bands),
+        Command::NaturalEndReached {
+            generation,
+            request_id,
+        } => {
+            if natural_end_matches_active_request(
+                engine.active_generation,
+                engine.active_request_id,
+                generation,
+                request_id,
+            ) && engine.natural_end_pending.is_none()
+            {
+                engine.next_natural_end_event_id = engine.next_natural_end_event_id.wrapping_add(1);
+                if engine.next_natural_end_event_id == 0 {
+                    engine.next_natural_end_event_id = 1;
+                }
+                let event = NaturalEndEvent {
+                    event_id: engine.next_natural_end_event_id,
+                    generation,
+                    request_id,
+                };
+                engine.natural_end_pending = Some(event.clone());
+                engine.invalidate_end_callback();
+                update_snapshot(snapshot, |state| {
+                    state.natural_end_event = Some(event);
+                });
+            }
+            Ok(())
+        }
+        Command::AcknowledgeNaturalEnd {
+            event_id,
+            generation,
+            request_id,
+        } => {
+            if engine.natural_end_pending.as_ref().is_some_and(|event| {
+                event.event_id == event_id
+                    && event.generation == generation
+                    && event.request_id == request_id
+            }) {
+                engine.natural_end_pending = None;
+                update_snapshot(snapshot, |state| state.natural_end_event = None);
+            }
+            Ok(())
+        }
     };
     match result {
         Ok(()) => update_snapshot(snapshot, |state| {
@@ -277,8 +597,45 @@ fn process_command(
             state.volume = engine.volume;
             state.muted = engine.muted;
             state.rate = engine.rate;
+            state.play_request_phase = engine.play_request_phase;
+            state.state = engine.state;
+            if play_result.is_some() || stop_result {
+                state.natural_end_event = None;
+            }
+            if let Some((request_id, is_video)) = play_result {
+                state.history_warning = engine.history_warning.clone();
+                state.video_play_result = if is_video {
+                    engine
+                        .current_path
+                        .clone()
+                        .map(|path| VideoPlayResult { request_id, path })
+                } else {
+                    None
+                };
+            }
         }),
-        Err(error) => update_snapshot(snapshot, |state| state.error = Some(error)),
+        Err(error) => {
+            if play_result.is_some() {
+                engine.deferred_pause = DeferredPauseState::None;
+                engine.play_request_phase = PlayRequestPhase::None;
+                engine.active_generation = 0;
+                engine.active_request_id = None;
+                engine.natural_end_pending = None;
+                engine.invalidate_end_callback();
+            }
+            update_snapshot(snapshot, |state| {
+                state.error = Some(error);
+                state.play_request_phase = engine.play_request_phase;
+                if play_result.is_some() {
+                    state.history_warning = engine.history_warning.clone();
+                    state.natural_end_event = None;
+                }
+                if let Some((request_id, _)) = play_result {
+                    let _ = request_id;
+                    state.video_play_result = None;
+                }
+            });
+        }
     }
     false
 }
@@ -300,6 +657,62 @@ struct Probe {
     deadline: Instant,
 }
 
+const VLC_EVENT_MEDIA_PLAYER_END_REACHED: c_int = 265;
+
+struct EndCallbackContext {
+    sender: Sender<Command>,
+    active: AtomicBool,
+    callbacks_in_flight: AtomicUsize,
+    generation: AtomicU64,
+    request_id: AtomicU64,
+}
+
+fn natural_end_matches_active_request(
+    active_generation: u64,
+    active_request_id: Option<u64>,
+    generation: u64,
+    request_id: u64,
+) -> bool {
+    active_generation != 0
+        && active_generation == generation
+        && active_request_id == Some(request_id)
+}
+
+impl EndCallbackContext {
+    fn activate(&self, generation: u64, request_id: u64) {
+        while self.callbacks_in_flight.load(Ordering::Acquire) != 0 {
+            thread::yield_now();
+        }
+        self.generation.store(generation, Ordering::Release);
+        self.request_id.store(request_id, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        while self.callbacks_in_flight.load(Ordering::Acquire) != 0 {
+            thread::yield_now();
+        }
+    }
+}
+
+extern "C" fn vlc_end_reached_callback(_event: *const c_void, user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    let context = unsafe { &*(user_data.cast::<EndCallbackContext>()) };
+    context.callbacks_in_flight.fetch_add(1, Ordering::AcqRel);
+    if context.active.load(Ordering::Acquire) {
+        let generation = context.generation.load(Ordering::Acquire);
+        let request_id = context.request_id.load(Ordering::Acquire);
+        let _ = context.sender.send(Command::NaturalEndReached {
+            generation,
+            request_id,
+        });
+    }
+    context.callbacks_in_flight.fetch_sub(1, Ordering::AcqRel);
+}
+
 struct VlcEngine {
     api: VlcApi,
     instance: *mut c_void,
@@ -312,13 +725,24 @@ struct VlcEngine {
     rate: f32,
     volume_pending: bool,
     state: PlaybackState,
+    play_request_phase: PlayRequestPhase,
     current_path: Option<PathBuf>,
+    history_warning: Option<String>,
+    deferred_pause: DeferredPauseState,
     equalizer_settings: (bool, f32, [f32; 10]),
     last_track_poll: Instant,
+    callback_context: Box<EndCallbackContext>,
+    callback_manager: *mut c_void,
+    callback_attached: bool,
+    active_generation: u64,
+    active_request_id: Option<u64>,
+    next_generation: u64,
+    next_natural_end_event_id: u64,
+    natural_end_pending: Option<NaturalEndEvent>,
 }
 
 impl VlcEngine {
-    fn new() -> Result<Self, String> {
+    fn new(callback_sender: Sender<Command>) -> Result<Self, String> {
         let (library, library_path, plugin_path) = load_vlc_library()?;
         // The API table stores copied function pointers; retaining Library keeps them valid.
         let api = unsafe { VlcApi::load(library)? };
@@ -357,15 +781,74 @@ impl VlcEngine {
             rate: 1.0,
             volume_pending: false,
             state: PlaybackState::Stopped,
+            play_request_phase: PlayRequestPhase::None,
             current_path: None,
+            history_warning: None,
+            deferred_pause: DeferredPauseState::None,
             equalizer_settings: (false, 0.0, [0.0; 10]),
             last_track_poll: Instant::now(),
+            callback_context: Box::new(EndCallbackContext {
+                sender: callback_sender,
+                active: AtomicBool::new(false),
+                callbacks_in_flight: AtomicUsize::new(0),
+                generation: AtomicU64::new(0),
+                request_id: AtomicU64::new(0),
+            }),
+            callback_manager: ptr::null_mut(),
+            callback_attached: false,
+            active_generation: 0,
+            active_request_id: None,
+            next_generation: 0,
+            next_natural_end_event_id: 0,
+            natural_end_pending: None,
         };
         engine.set_volume(70)?;
         Ok(engine)
     }
 
-    fn play(&mut self, path: PathBuf, video_target: usize) -> Result<(), String> {
+    fn invalidate_end_callback(&mut self) {
+        self.callback_context.deactivate();
+        if self.callback_attached && !self.callback_manager.is_null() {
+            unsafe {
+                (self.api.event_detach)(
+                    self.callback_manager,
+                    VLC_EVENT_MEDIA_PLAYER_END_REACHED,
+                    vlc_end_reached_callback,
+                    self.callback_context.as_ref() as *const EndCallbackContext as *mut c_void,
+                );
+            }
+        }
+        self.callback_context.deactivate();
+        self.callback_attached = false;
+        self.callback_manager = ptr::null_mut();
+    }
+
+    fn attach_end_callback(&mut self, generation: u64, request_id: u64) -> Result<(), String> {
+        self.invalidate_end_callback();
+        let manager = unsafe { (self.api.player_event_manager)(self.player) };
+        if manager.is_null() {
+            return Err("libVLC could not provide the media player event manager.".to_owned());
+        }
+        self.callback_manager = manager;
+        self.callback_context.activate(generation, request_id);
+        let result = unsafe {
+            (self.api.event_attach)(
+                manager,
+                VLC_EVENT_MEDIA_PLAYER_END_REACHED,
+                vlc_end_reached_callback,
+                self.callback_context.as_ref() as *const EndCallbackContext as *mut c_void,
+            )
+        };
+        if result != 0 {
+            self.invalidate_end_callback();
+            return Err("libVLC could not attach the natural end callback.".to_owned());
+        }
+        self.callback_attached = true;
+        Ok(())
+    }
+
+    fn play(&mut self, path: PathBuf, video_target: usize, request_id: u64) -> Result<(), String> {
+        self.history_warning = None;
         if !path.is_file() {
             return Err(format!(
                 "Media file is no longer available: {}",
@@ -386,14 +869,27 @@ impl VlcEngine {
             ));
         }
         self.stop_current();
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        let generation = self.next_generation;
         unsafe {
             (self.api.player_set_media)(self.player, media);
             (self.api.media_parse_async)(media);
         }
         self.media = media;
-        self.current_path = Some(path.clone());
         self.video_target = video_target;
         unsafe { (self.api.player_set_hwnd)(self.player, video_target as *mut c_void) };
+        self.active_generation = generation;
+        self.active_request_id = Some(request_id);
+        self.natural_end_pending = None;
+        if let Err(error) = self.attach_end_callback(generation, request_id) {
+            self.active_generation = 0;
+            self.active_request_id = None;
+            self.stop_current();
+            return Err(error);
+        }
         if (unsafe { (self.api.player_play)(self.player) }) != 0 {
             self.stop_current();
             return Err(format!(
@@ -403,28 +899,81 @@ impl VlcEngine {
             ));
         }
         self.state = PlaybackState::Loading;
+        self.play_request_phase = PlayRequestPhase::Loading(request_id);
+        self.current_path = Some(path.clone());
         self.apply_audio_settings()?;
-        append_history(&path)?;
+        self.history_warning = append_history(&path).err();
         Ok(())
     }
 
-    fn pause(&mut self) -> Result<(), String> {
+    fn pause(&mut self, request_id: Option<u64>) -> Result<(), String> {
+        match self.play_request_phase {
+            PlayRequestPhase::PendingDelay(active_id) | PlayRequestPhase::Loading(active_id) => {
+                if request_id.is_some_and(|id| id != active_id) {
+                    return Ok(());
+                }
+                let previous = self.deferred_pause;
+                let next = toggle_loading_pause_request(previous);
+                match (previous, next) {
+                    (DeferredPauseState::PauseSent, DeferredPauseState::ResumeSent) => {
+                        unsafe { (self.api.player_set_pause)(self.player, 0) };
+                    }
+                    (DeferredPauseState::ResumeSent, DeferredPauseState::PauseSent) => {
+                        unsafe { (self.api.player_set_pause)(self.player, 1) };
+                    }
+                    _ => {}
+                }
+                self.deferred_pause = next;
+                return Ok(());
+            }
+            PlayRequestPhase::Active(active_id) => {
+                if request_id.is_some_and(|id| id != active_id) {
+                    return Ok(());
+                }
+            }
+            PlayRequestPhase::None => {}
+        }
         if self.media.is_null() {
             return Err("Load a track before using Pause.".to_owned());
         }
-        let next = if self.state == PlaybackState::Playing {
-            PlaybackState::Paused
-        } else {
-            PlaybackState::Playing
+        self.deferred_pause = match self.deferred_pause {
+            DeferredPauseState::PauseSent => {
+                unsafe { (self.api.player_set_pause)(self.player, 0) };
+                DeferredPauseState::ResumeSent
+            }
+            DeferredPauseState::ResumeSent => {
+                unsafe { (self.api.player_set_pause)(self.player, 1) };
+                DeferredPauseState::PauseSent
+            }
+            DeferredPauseState::None | DeferredPauseState::Requested => {
+                let next = if self.state == PlaybackState::Playing {
+                    PlaybackState::Paused
+                } else {
+                    PlaybackState::Playing
+                };
+                unsafe {
+                    (self.api.player_set_pause)(
+                        self.player,
+                        i32::from(next == PlaybackState::Paused),
+                    )
+                };
+                if next == PlaybackState::Paused {
+                    DeferredPauseState::PauseSent
+                } else {
+                    DeferredPauseState::ResumeSent
+                }
+            }
         };
-        unsafe {
-            (self.api.player_set_pause)(self.player, i32::from(next == PlaybackState::Paused))
-        };
-        self.state = next;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), String> {
+        self.deferred_pause = DeferredPauseState::None;
+        self.play_request_phase = PlayRequestPhase::None;
+        self.active_generation = 0;
+        self.active_request_id = None;
+        self.natural_end_pending = None;
+        self.invalidate_end_callback();
         if !self.media.is_null() {
             unsafe { (self.api.player_stop)(self.player) };
         }
@@ -433,6 +982,10 @@ impl VlcEngine {
     }
 
     fn stop_current(&mut self) {
+        self.invalidate_end_callback();
+        self.active_generation = 0;
+        self.active_request_id = None;
+        self.natural_end_pending = None;
         if !self.media.is_null() {
             unsafe {
                 (self.api.player_stop)(self.player);
@@ -441,6 +994,7 @@ impl VlcEngine {
             }
             self.media = ptr::null_mut();
         }
+        self.current_path = None;
         self.state = PlaybackState::Stopped;
     }
 
@@ -638,6 +1192,14 @@ impl VlcEngine {
 
     fn refresh(&mut self, snapshot: &Arc<Mutex<PlaybackSnapshot>>) {
         if self.media.is_null() {
+            let state = self.state;
+            update_snapshot(snapshot, |snapshot| {
+                snapshot.path = self.current_path.clone();
+                snapshot.position = None;
+                snapshot.duration = None;
+                snapshot.state = state;
+                snapshot.play_request_phase = self.play_request_phase;
+            });
             return;
         }
         let time = unsafe { (self.api.player_get_time)(self.player) };
@@ -646,13 +1208,41 @@ impl VlcEngine {
         let duration = (length > 0).then(|| Duration::from_millis(length as u64));
         match unsafe { (self.api.player_get_state)(self.player) } {
             1 | 2 => self.state = PlaybackState::Loading,
-            3 => self.state = PlaybackState::Playing,
-            4 => self.state = PlaybackState::Paused,
-            5 | 6 => self.state = PlaybackState::Stopped,
-            7 => {
+            3 => {
+                let (phase, deferred, state, send_pause) =
+                    apply_confirmed_vlc_state(self.play_request_phase, self.deferred_pause, 3);
+                self.play_request_phase = phase;
+                self.deferred_pause = deferred;
+                self.state = state;
+                if send_pause {
+                    unsafe { (self.api.player_set_pause)(self.player, 1) };
+                }
+            }
+            4 => {
+                let (phase, deferred, state, _) =
+                    apply_confirmed_vlc_state(self.play_request_phase, self.deferred_pause, 4);
+                self.play_request_phase = phase;
+                self.deferred_pause = deferred;
+                self.state = state;
+            }
+            5 | 6 => {
+                self.deferred_pause = DeferredPauseState::None;
+                self.play_request_phase = PlayRequestPhase::None;
                 self.state = PlaybackState::Stopped;
+            }
+            7 => {
+                self.deferred_pause = DeferredPauseState::None;
+                self.play_request_phase = PlayRequestPhase::None;
+                self.state = PlaybackState::Stopped;
+                self.active_generation = 0;
+                self.active_request_id = None;
+                self.natural_end_pending = None;
+                self.invalidate_end_callback();
                 let error = self.last_error();
-                update_snapshot(snapshot, |snapshot| snapshot.error = Some(error));
+                update_snapshot(snapshot, |snapshot| {
+                    snapshot.error = Some(error);
+                    snapshot.natural_end_event = None;
+                });
             }
             _ => {}
         }
@@ -665,6 +1255,7 @@ impl VlcEngine {
         update_snapshot(snapshot, |snapshot| {
             snapshot.ready = true;
             snapshot.path = self.current_path.clone();
+            snapshot.play_request_phase = self.play_request_phase;
             snapshot.position = position;
             snapshot.duration = duration;
             snapshot.state = state;
@@ -928,6 +1519,19 @@ struct VlcApi {
     media_get_duration: unsafe extern "C" fn(*mut c_void) -> i64,
     media_get_meta: unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_char,
     player_new: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    player_event_manager: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    event_attach: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        unsafe extern "C" fn(*const c_void, *mut c_void),
+        *mut c_void,
+    ) -> c_int,
+    event_detach: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        unsafe extern "C" fn(*const c_void, *mut c_void),
+        *mut c_void,
+    ),
     player_release: unsafe extern "C" fn(*mut c_void),
     player_set_media: unsafe extern "C" fn(*mut c_void, *mut c_void),
     player_play: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -984,6 +1588,11 @@ impl VlcApi {
             media_get_duration: unsafe { required(&library, b"libvlc_media_get_duration\0")? },
             media_get_meta: unsafe { required(&library, b"libvlc_media_get_meta\0")? },
             player_new: unsafe { required(&library, b"libvlc_media_player_new\0")? },
+            player_event_manager: unsafe {
+                required(&library, b"libvlc_media_player_event_manager\0")?
+            },
+            event_attach: unsafe { required(&library, b"libvlc_event_attach\0")? },
+            event_detach: unsafe { required(&library, b"libvlc_event_detach\0")? },
             player_release: unsafe { required(&library, b"libvlc_media_player_release\0")? },
             player_set_media: unsafe { required(&library, b"libvlc_media_player_set_media\0")? },
             player_play: unsafe { required(&library, b"libvlc_media_player_play\0")? },
@@ -1027,7 +1636,20 @@ impl VlcApi {
 
 #[cfg(test)]
 mod tests {
-    use super::is_no_audio_output_error;
+    use super::{
+        DeferredPauseState, PlayRequestPhase, apply_confirmed_vlc_state, is_no_audio_output_error,
+        natural_end_matches_active_request, parse_debug_loading_delay_ms, pending_play_is_ready,
+        toggle_loading_pause_request,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn natural_end_requires_matching_generation_and_request() {
+        assert!(natural_end_matches_active_request(4, Some(17), 4, 17));
+        assert!(!natural_end_matches_active_request(4, Some(17), 4, 18));
+        assert!(!natural_end_matches_active_request(5, Some(17), 4, 17));
+        assert!(!natural_end_matches_active_request(0, Some(17), 0, 17));
+    }
 
     #[test]
     fn recognizes_only_the_temporary_missing_audio_output_error() {
@@ -1037,6 +1659,96 @@ mod tests {
         assert!(!is_no_audio_output_error(
             "Could not set volume: invalid value"
         ));
+    }
+
+    #[test]
+    fn loading_pause_request_toggles_and_cancels() {
+        assert_eq!(
+            toggle_loading_pause_request(DeferredPauseState::None),
+            DeferredPauseState::Requested
+        );
+        assert_eq!(
+            toggle_loading_pause_request(DeferredPauseState::Requested),
+            DeferredPauseState::None
+        );
+    }
+
+    #[test]
+    fn pending_pause_command_is_sent_only_once() {
+        assert_eq!(
+            toggle_loading_pause_request(DeferredPauseState::PauseSent),
+            DeferredPauseState::ResumeSent
+        );
+        assert_eq!(
+            toggle_loading_pause_request(DeferredPauseState::ResumeSent),
+            DeferredPauseState::PauseSent
+        );
+    }
+
+    #[test]
+    fn play_pause_playing_paused_sequence_keeps_active_request() {
+        let phase = PlayRequestPhase::Loading(17);
+        let requested = toggle_loading_pause_request(DeferredPauseState::None);
+        assert_eq!(requested, DeferredPauseState::Requested);
+
+        let (playing_phase, deferred, state, send_pause) =
+            apply_confirmed_vlc_state(phase, requested, 3);
+        assert_eq!(playing_phase, phase);
+        assert_eq!(deferred, DeferredPauseState::PauseSent);
+        assert_eq!(state, super::PlaybackState::Loading);
+        assert!(send_pause);
+
+        let (paused_phase, deferred, state, send_pause) =
+            apply_confirmed_vlc_state(playing_phase, deferred, 4);
+        assert_eq!(paused_phase, PlayRequestPhase::Active(17));
+        assert_eq!(deferred, DeferredPauseState::None);
+        assert_eq!(state, super::PlaybackState::Paused);
+        assert!(!send_pause);
+    }
+
+    #[test]
+    fn play_pause_cancel_sequence_does_not_keep_requested_pause() {
+        let first = toggle_loading_pause_request(DeferredPauseState::None);
+        let canceled = toggle_loading_pause_request(first);
+        assert_eq!(canceled, DeferredPauseState::None);
+    }
+
+    #[test]
+    fn pending_play_replacement_and_stop_clear_old_request_pause() {
+        let old = PlayRequestPhase::PendingDelay(7);
+        let new = PlayRequestPhase::PendingDelay(8);
+        assert_ne!(old, new);
+        assert_eq!(DeferredPauseState::None, DeferredPauseState::None);
+        assert_eq!(PlayRequestPhase::None, PlayRequestPhase::None);
+    }
+
+    #[test]
+    fn vlc_playing_after_second_pause_resumes_normally() {
+        let phase = PlayRequestPhase::Loading(23);
+        let deferred = toggle_loading_pause_request(DeferredPauseState::None);
+        let deferred = toggle_loading_pause_request(deferred);
+        assert_eq!(deferred, DeferredPauseState::None);
+
+        let (phase, deferred, state, send_pause) = apply_confirmed_vlc_state(phase, deferred, 3);
+        assert_eq!(phase, PlayRequestPhase::Active(23));
+        assert_eq!(deferred, DeferredPauseState::None);
+        assert_eq!(state, super::PlaybackState::Playing);
+        assert!(!send_pause);
+    }
+
+    #[test]
+    fn debug_loading_delay_parser_supports_zero_and_milliseconds() {
+        assert_eq!(parse_debug_loading_delay_ms("0"), 0);
+        assert_eq!(parse_debug_loading_delay_ms("125"), 125);
+        assert_eq!(parse_debug_loading_delay_ms("not-a-number"), 3000);
+    }
+
+    #[test]
+    fn pending_play_readiness_can_be_tested_without_sleeping() {
+        let now = Instant::now();
+        assert!(pending_play_is_ready(now, now));
+        assert!(pending_play_is_ready(now, now + Duration::from_millis(1)));
+        assert!(!pending_play_is_ready(now + Duration::from_millis(1), now));
     }
 
     #[cfg(windows)]

@@ -1,6 +1,6 @@
 use egui::{
-    Align2, Color32, Context, CornerRadius, FontFamily, FontId, Painter, Rect, Response, Sense,
-    Shape, Stroke, StrokeKind, TextStyle, Ui, Vec2, Visuals, pos2, vec2,
+    Align2, Color32, Context, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Response,
+    Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, Vec2, Visuals, pos2, vec2,
 };
 use std::ops::RangeInclusive;
 
@@ -103,6 +103,13 @@ pub fn bevel_rect(painter: &Painter, rect: Rect, fill: Color32, pressed: bool) {
 pub struct TitleBarResult {
     pub clicked: Option<usize>,
     pub drag_started: bool,
+    pub dragged: bool,
+    pub drag_stopped: bool,
+    pub drag_hovered: bool,
+    pub rect: Rect,
+    pub drag_rect: Rect,
+    pub drag_pointer_pos: Option<Pos2>,
+    pub first_button_rect: Option<Rect>,
 }
 
 pub fn title_bar(ui: &mut Ui, title: &str, buttons: &[(&str, bool)]) -> TitleBarResult {
@@ -138,6 +145,7 @@ pub fn title_bar(ui: &mut Ui, title: &str, buttons: &[(&str, bool)]) -> TitleBar
     let gap = 2.0;
     let buttons_left = rect.right() - 3.0 - buttons.len() as f32 * (button_width + gap) + gap;
     let mut clicked = None;
+    let mut first_button_rect = None;
     for (index, (label, active)) in buttons.iter().enumerate() {
         let button_rect = Rect::from_min_size(
             pos2(
@@ -146,6 +154,9 @@ pub fn title_bar(ui: &mut Ui, title: &str, buttons: &[(&str, bool)]) -> TitleBar
             ),
             vec2(button_width, button_height),
         );
+        if index == 0 {
+            first_button_rect = Some(button_rect);
+        }
         let response = ui.interact(
             button_rect,
             ui.scope_id().with(("title-button", title, index)),
@@ -173,14 +184,22 @@ pub fn title_bar(ui: &mut Ui, title: &str, buttons: &[(&str, bool)]) -> TitleBar
             clicked = Some(index);
         }
     }
+    let drag_rect = Rect::from_min_max(rect.min, pos2(buttons_left - 2.0, rect.max.y));
     let drag_response = ui.interact(
-        Rect::from_min_max(rect.min, pos2(buttons_left - 2.0, rect.max.y)),
+        drag_rect,
         ui.scope_id().with(("title-drag", title)),
         Sense::click_and_drag(),
     );
     TitleBarResult {
         clicked,
         drag_started: drag_response.drag_started(),
+        dragged: drag_response.dragged(),
+        drag_stopped: drag_response.drag_stopped(),
+        drag_hovered: drag_response.hovered(),
+        rect,
+        drag_rect,
+        drag_pointer_pos: drag_response.interact_pointer_pos(),
+        first_button_rect,
     }
 }
 
