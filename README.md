@@ -1,19 +1,40 @@
 # RetroWave Player
 
-A compact Windows desktop audio and video player inspired by the classic Winamp 2.x interface.
+> **Status: Pre-release development**
+>
+> The first public version of RetroWave Player is expected in the near future. The release date has not been announced.
 
-Built with **Rust**, **egui**, and a dynamically loaded **libVLC** media engine, RetroWave Player combines a retro-inspired interface with real media playback.
+RetroWave Player is a compact desktop audio and video player inspired by the classic Winamp 2.x interface. It is built with **Rust**, **egui**, and a dynamically loaded **libVLC** media engine.
 
-## Interface
+## Development status
 
-RetroWave Player features a custom dark interface with beveled controls, a green LCD-style display, and independent windows.
+### Implemented
 
-- **Main Player** — compact, fixed-size window (430 × 155 px).
-- **Equalizer** — separate fixed-size window (300 × 195 px).
-- **Playlist** — independent, resizable window.
-- **Video Player** — separate video output window with fullscreen support.
+- [x] Audio playback: play, pause, resume and stop.
+- [x] Previous and next track controls.
+- [x] Playlist with file picker and drag-and-drop support.
+- [x] Playback seeking, volume and mute.
+- [x] Playback speed adjustment.
+- [x] Ten-band equalizer with preamp.
+- [x] Separate video window and fullscreen playback.
+- [x] Audio and subtitle track selection.
+- [x] Custom retro-inspired interface.
+- [x] Playback state handling and automatic track advancement.
+- [x] Basic window lifecycle and shutdown handling.
 
-The interface includes custom title bars, transport controls, playback information, and familiar Winamp-inspired styling.
+### In progress
+
+- [ ] Fix video viewport rendering after Windows desktop minimize/restore (`Win + D`).
+- [ ] Improve resize hit zones in the video window.
+- [ ] Complete manual testing of video window behavior.
+- [ ] Continue reviewing playback and interface edge cases.
+
+### Planned
+
+- [ ] Prepare the first public release.
+- [ ] Create a Windows installer.
+- [ ] Continue improving stability and compatibility.
+- [ ] Explore cross-platform support.
 
 ## Features
 
@@ -51,8 +72,6 @@ The interface includes custom title bars, transport controls, playback informati
 - Subtitle-track selection and external SRT/ASS subtitle loading.
 
 ## Supported media
-
-The application accepts the following file extensions:
 
 | Type | Formats |
 |---|---|
@@ -116,11 +135,7 @@ src/
 
 ## License
 
-RetroWave Player is licensed under the
-GNU General Public License v3.0 or later (GPL-3.0-or-later).
-
-You may use, modify, and redistribute this software
-under the terms of the license.
+RetroWave Player is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).
 
 See the LICENSE file for the full license text.
 
